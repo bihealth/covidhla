@@ -1,0 +1,1607 @@
+---
+title: "HLA typing / Covid"
+subtitle: "Report (3rd version, mk3)"
+author: "January Weiner"
+date: "`r Sys.Date()`"
+outputdupa: powerpoint_presentation
+always_allow_html: true
+outputpipa: 
+  html_document:
+    toc: true
+    toc_float:
+        collapsed: true
+        smooth_scroll: true
+    toc_depth: 3
+    fig_caption: yes
+    number_sections: true
+output: word_document
+outputcipa:
+  ioslides_presentation: 
+    widescreen: true
+    smaller: true
+    css: files/style.css
+    logo: files/logo_bihealth_en.png
+toc: no
+---
+
+```{r}
+patient_IDs_to_exclude <- c(
+"C19-CB-0092", # cc90
+"C19-CB-0022", # cc20
+"C19-CB-0051", # cc49
+"C19-CB-0120", # cc117
+"C19-CB-0067", # cc65
+"C19-CB-0003", # cc3
+"C19-CB-0005", # cc4
+"C19-CB-0060", # cc58
+"C19-CB-0063", # cc61
+"C19-CB-0023"  # cc21
+)
+```
+
+```{r,echo=FALSE}
+## Set default options for the knitr RMD processing
+knitr::opts_chunk$set(echo=FALSE,warning=FALSE,message=FALSE,fig.width=5,fig.height=5,cache=FALSE,autodep=TRUE, results="hide")
+```
+
+```{r libraries,cache=FALSE}
+library(tidyverse)
+library(XML)
+library(colorDF)
+library(readxl)
+library(writexl)
+library(cowplot)
+library(splitstackshape)
+library(HIBAG)
+library(pander)
+library(beeswarm)
+library(randomForest)
+library(FactoMineR)
+library(factoextra)
+library(DT)
+source("functions.R")
+```
+
+```{r parameters}
+min_freq    <- 0.05
+min_patient <- 5
+```
+
+```{r read_files}
+message("reading files")
+
+clin1 <- read_xlsx("meta_data/Copy of clinicaldata_cdna_PS_13.10.2020-Updated.xlsx")
+clin2 <- read_xlsx("meta_data/Copy of clinicaldata_cdna_PS_13.10.2020-Updated.xlsx", sheet=2)
+cc <- intersect(colnames(clin1), colnames(clin2))
+
+clin <- clin_orig <- rbind(clin1[, cc], clin2[, cc]) %>% 
+  rename(ID=1, intub="Intubation (Yes=1/No=0)", death="Tod (Yes=1/No=0)", icu="ICU Y/N") %>% 
+  mutate(ID=tolower(ID), icu=toupper(gsub(" .*", "", icu))) %>%
+  filter(!is.na(ID))
+
+clin$troponine     <- as.numeric(gsub(" .*", "", clin[["Troponin -T [ng/l]"]]))
+clin$troponine_max <- as.numeric(gsub(" .*", "", clin[["Troponin -T (max) [ng/l]"]]))
+clin$tropo     <- c("NO", "YES")[ (as.numeric(gsub(" .*", "", clin[["Troponin -T [ng/l]"]])) > 14) + 1 ]
+clin$tropo_max <- c("NO", "YES")[ (as.numeric(gsub(" .*", "", clin[["Troponin -T (max) [ng/l]"]])) > 14) + 1 ]
+message(class(clin$icu))
+```
+
+```{r adding_key}
+## Add Patient_ID key
+key <- read_xlsx("meta_data/January_MK-V7_311020_ps_14.00.xlsx") %>% 
+  rename_with(~ gsub("-", "_", .)) %>%
+  mutate(Patient_ID=ifelse(Patient_ID == "NA", gsub("  *", "-", gsub(",.*", "", CC_ID)), Patient_ID)) %>%
+  mutate(CC_ID=gsub("  *", "", CC_ID)) %>%
+  separate_rows(CC_ID, sep=",") %>%
+  pivot_longer(starts_with("Sample"), names_to="tube_sample", values_to="SampleID") %>% 
+  filter(!(duplicated(Patient_ID) & is.na(SampleID))) %>%
+  select(Patient_ID, CC_ID, SampleID, Comments)
+
+clin$Patient_ID <- key$Patient_ID[ match(tolower(clin$ID), tolower(key$CC_ID)) ]
+clin$SampleID  <- map_chr(clin$Patient_ID, ~ paste(key$SampleID[ key$Patient_ID == . ], collapse=","))
+
+```
+
+```{r remove_nonconsent}
+## remove individuals who retracted their consent
+## also, remove individual with no Covid
+
+dropouts <- read_xlsx("../meta_data/Dropout_please delete_PS_V2_7112020.xlsx")
+clin <- clin %>% filter(!Patient_ID %in% dropouts[["Pat ID"]])
+
+keys_new <- read_xlsx("../meta_data/Key131020.xlsx", sheet=1) %>%
+  select(1:6) %>%
+  set_names(c("TubeID", "Comments", "SIDNum", "BHID", "SID", "NEG")) %>%
+  mutate(NEG=ifelse(is.na(NEG), "no", NEG)) %>%
+  mutate(SIDNum=as.numeric(SIDNum))
+
+covid_neg <- keys_new %>% filter(NEG == "yes")
+
+clin <- clin %>% filter(!(Patient_ID %in% covid_neg$SID | ID %in% covid_neg$BHID))
+```
+
+```{r who_icu, cache=TRUE}
+## Adding WHO ICU score. Need three additional files for that
+
+## first, the who score
+who <- xmlParse("meta_data/Export Demografie, Risikofaktoren und WHO Scale/WHOScale_0901.xml") %>% xmlToDataFrame %>%
+  mutate(PatIDNumeric=gsub(".*-0*([1-9]+[0-9]*)$", "\\1", PatID))
+
+who.max    <- who %>% group_by(PatID) %>% summarise(max_whoscore=max(WHOScaleWert, na.rm=TRUE))
+who.screen <- who %>% filter(grepl("(Screening)", mnpvislabel))
+
+clin$who     <- who.screen$WHOScaleWert[ match(clin$Patient_ID, who.screen$PatID) ] %>% as.numeric
+clin$who.max <- who.max$max_whoscore[ match(clin$Patient_ID, who.max$PatID) ] %>% as.numeric
+```
+
+```{r mca_score, cache=TRUE}
+foo <- clin %>% select(ID, death, icu, intub, troponine) %>% 
+    mutate_all(~ factor(.)) %>% 
+    mutate(troponine=as.numeric(as.character(troponine))) %>%
+    mutate(troponine=factor(findInterval(troponine, seq(0, 50, by=10))))
+    
+    as.data.frame
+rownames(foo) <- foo$ID
+foo$ID <- NULL
+mca <- MCA(foo, graph=F)
+
+ind <- get_mca_ind(mca)
+clin$MCA_big <- ind$coord[,1]
+
+foo <- clin %>% select(ID, death, icu, intub) %>% 
+    mutate_all(~ factor(.)) %>% as.data.frame
+rownames(foo) <- foo$ID
+foo$ID <- NULL
+mca <- MCA(foo, graph=F)
+
+ind <- get_mca_ind(mca)
+clin$MCA_small <- ind$coord[,1]
+```
+
+```{r clinical_data_spain_switzerland}
+#clin_es <- read_xlsx("../meta_data/Data base July2020 (3)_Sevilla_LMR.xlsx") %>%
+clin_es <- read_xlsx("../meta_data/Data base July2020_3.xlsx") %>%
+  mutate(ID=paste0("ES", .[["COD ext"]])) %>%
+  rename(ICU="Admision in Intensive care unit", intub="Intubated") %>%
+  replace_na(list(ICU="No")) %>% mutate(ICU=toupper(ICU), intub=toupper(intub)) %>%
+  mutate(Severity=c("Mild airway symptoms"="low", "Pneumonia"="high", "asymptomatic"="low", "Severe pneumonia"="high")[ .[["Clinical symptons"]] ])
+
+clin_ch <- read_xls("../meta_data/ETHKSBCovid19Myokard_DATA_1.Ladung.22.07.20.BadenDP.xls") %>%
+  mutate(ID=paste0("SB", pid)) %>%
+rename(ICU=icu_yn, intub="invasive_ventilation") %>%
+  mutate(ICU=c("NO", "YES")[ICU + 1]) %>%
+  mutate(intub=c("NO", "YES")[intub + 1])
+
+clin_ch_sum <- clin_ch %>% summary_colorDF
+clin_ch <- clin_ch[ , clin_ch_sum$NAs < nrow(clin_ch) & clin_ch_sum$unique > 1 ]
+
+clin_ch2 <- read_xls("../meta_data/covidmyo labor nachbestimmungen 280820_no ID.xls") %>% 
+  filter(grepl("^SB", Patientenname))
+
+clin_ch2_w <- clin_ch2 %>% pivot_wider(id_cols=Patientenname, values_from="Resultat (S2)", names_from=Ausdruck) %>% 
+  mutate_at(2:5, ~ as.numeric(gsub(" *", "", gsub("^[><]", "", gsub(",", ".", .))))) %>% 
+  set_names(c("ID", "TropoT", "CPK", "BNP", "TSH"))
+
+#clin_ch$troponine <- as.numeric(gsub(",", ".", clin_ch2[["Resultat (S2)"]]))[ match(clin_ch$ID, clin_ch2$Patientenname) ]
+clin_ch <- merge(clin_ch, clin_ch2_w, by="ID", all.x=TRUE)
+
+clin_eg <- read_xlsx("../meta_data/clinicaldata_cdna_most relevant_FGG.xlsx") %>%
+  rename(ID="Sample ID") %>% 
+  rename(ICU="ICU Admittance") %>%
+  filter(!is.na(ID)) %>%
+  mutate(ID=paste0("EG", ID))
+clin_eg$ICU[nrow(clin_eg)] <- "NO"
+clin_eg$troponine <- as.numeric(gsub(",", ".", gsub("<", "", clin_eg[["Troponin -I pg7ml"]])))
+clin_eg$crp <- as.numeric(gsub(",", ".", clin_eg[["CRP (C-reactive protein) [mg/l]"]]))
+```
+
+```{r batch2_reading}
+hla_new <- hla_new_orig_1a <- read_xlsx("meta_data/2020-08-26_Heidecker_HLA_Typing.xlsx", sheet=1) %>%
+  select(ID="Sample name", locus=Locus, alleles="Typing result") %>%
+  mutate(Patient_ID=key$Patient_ID[ match(tolower(ID), tolower(key$CC_ID)) ]) %>%
+  filter(!Patient_ID %in% patient_IDs_to_exclude)
+
+hla_batch2a <- read_delim("meta_data/Heidecker-Covid-19-Batch2-qm_2020-09-28.csv", delim=";")
+hla_batch2b <- read_delim("meta_data/HLA Reads 3-qm_2020-10-07.csv", delim=";")
+hla_batch2_full <- rbind(hla_batch2b, hla_batch2a) %>% 
+  select(ID="Sample name", locus=Locus, alleles="Typing result") %>%
+  filter(!duplicated(paste0(ID, locus)))
+
+## we need to remap the berlin sample IDs
+hla_batch2_berlin <- hla_batch2_full %>% filter(grepl("^LV", ID)) %>%
+  mutate(Patient_ID=key$Patient_ID[ match(ID, key$SampleID) ]) %>%
+  filter(!Patient_ID %in% patient_IDs_to_exclude)
+
+hla_new <- rbind(hla_batch2_berlin, hla_new) %>%
+  filter(!duplicated(paste0(Patient_ID, locus)))
+
+#source("problematic_samples.R")
+#ids_exclude <- problem_ids %>% filter(!grepl("^OK:", comment)) %>% pull(ids2) %>% strsplit(",") %>% unlist
+#hla_new <- hla_new %>% filter(!Patient_ID %in% ids_exclude)
+
+hla_batch2 <- hla_batch2_full %>% filter(!grepl("^LV", ID))
+```
+
+```{r coding_alleles,eval=TRUE}
+## coding alleles for collaborators, to hide the genetic information from the patients
+hla_2code <- hla_new %>% select(CC_ID=ID, Patient_ID, locus, alleles) %>%
+  mutate(alleles=ifelse(alleles == "I n s u f f i c i e n t   d a t a", NA, alleles)) %>%
+  mutate(alleles_l=strsplit(alleles, ", *")) %>%
+  mutate(allele1=map_chr(strsplit(alleles, ", "), ~ .[[1]]),
+         allele2=map_chr(strsplit(alleles, ", "), ~ if(length(.) < 2) { .[[1]] } else { .[[2]]} )) %>%
+  mutate(allele1=gsub("^.*\\*", "", allele1)) %>% 
+  mutate(allele2=gsub("^.*\\*", "", allele2)) %>%
+  select(CC_ID, Patient_ID, locus, allele1, allele2) %>% drop_na()
+
+set.seed(20201001)
+
+alleles <- unique(sort(c(hla_2code$allele1, hla_2code$allele2)))
+alleles_split <- strsplit(alleles, ":")
+names(alleles_split) <- alleles
+
+let_code <- expand.grid(LETTERS, LETTERS) %>% apply(1, paste, collapse="")
+
+recode <- lapply(1:4, function(i) {
+  pos <- map_chr(alleles_split, ~ .x[i]) %>% unique() %>% sort
+  pos_enc <- sample(let_code, length(pos))
+  names(pos_enc) <- pos
+  pos_enc
+})
+
+encoded <- lapply(1:4, function(i) {
+  pos <- map_chr(alleles_split, ~ .x[i]) 
+  ret <- recode[[i]][ pos ]
+  ret[is.na(ret)] <- ""
+  names(ret) <- alleles
+  ret
+})
+
+encoded <- Reduce(paste, encoded) %>% { gsub("  *$", "", .) } %>% { gsub(" ", ":", .) }
+names(encoded) <- alleles
+
+hla_encoded <- hla_2code %>% mutate(
+  allele1_encoded=encoded[ allele1 ],
+  allele2_encoded=encoded[ allele2 ])
+
+encoding_key <- data.frame(allele=alleles, encoded=encoded)
+
+write_xlsx(list("Unblinded data"=hla_encoded, "Encoding key"=encoding_key), path="hla_set1_unblinded.xlsx")
+write_xlsx(hla_encoded %>% select(CC_ID, Patient_ID, locus, allele1_encoded, allele2_encoded), path="hla_set1_blinded.xlsx")
+```
+
+```{r viral_load}
+viral_load_terry <- read_xlsx("meta_data/viral_load_20201123-patient-study-ids-result.xlsx")
+viral_load_guido <- read_csv("meta_data/TC_model_parameters_by_participant.csv") %>% filter(variable == "intercept")
+viral_load <- merge(viral_load_terry, viral_load_guido, all.x=TRUE, by.x="Person hash", by.y="personHash") %>%
+  filter(!is.na(.data[["First PCR viral load"]])) %>%
+  rename(Patient_ID=StudyId, "est_peak_bayes"=mean, "pcr_measurement_01"="First PCR viral load", "est_peak_SA"="Est. peak viral load (SA)") %>%
+  select(-variable, -"Person hash")
+```
+
+```{r clean_up_hla}
+## filter by availability of clinical data
+hla_new <- hla_new[ hla_new$Patient_ID %in% clin$Patient_ID, ]
+
+hla <- hla_new %>% select(Patient_ID, locus, alleles) %>%
+  mutate(alleles=ifelse(alleles == "I n s u f f i c i e n t   d a t a", NA, alleles)) %>%
+  mutate(alleles_l=strsplit(alleles, ", *")) %>%
+  mutate(allele1=map_chr(strsplit(alleles, ", "), ~ .[[1]]),
+         allele2=map_chr(strsplit(alleles, ", "), ~ if(length(.) < 2) { .[[1]] } else { .[[2]]} )) %>%
+  mutate(allele1=gsub("^.*\\*", "", allele1)) %>%
+  mutate(allele2=gsub("^.*\\*", "", allele2)) %>%
+  mutate(allele1_trunc=gsub("^([0-9]{2}:[0-9]{2}).*", "\\1", allele1)) %>%
+  mutate(allele2_trunc=gsub("^([0-9]{2}:[0-9]{2}).*", "\\1", allele2))
+
+hla_l <- hla %>% mutate(homozygous=allele1 == allele2) %>%
+         select(Patient_ID, locus, homozygous, allele1, allele2) %>%
+         pivot_longer(cols=c(allele1, allele2), names_to="allele_n", values_to="allele_v") %>%
+         mutate(allele_trunc=map_chr(allele_v, ~ gsub("^([0-9]{2}:[0-9]{2}).*", "\\1", .))) %>%
+         mutate(allele_full=paste0(locus, "*", allele_v)) %>%
+         mutate(allele_trunc_full=paste0(locus, "*", allele_trunc))
+```
+
+```{r batch2_cleanup}
+hla_b2 <- hla_batch2 %>% select(ID, locus, alleles) %>%
+  mutate(alleles=ifelse(alleles == "I n s u f f i c i e n t   d a t a", NA, alleles)) %>%
+  mutate(alleles_l=strsplit(alleles, ", *")) %>%
+  mutate(allele1=map_chr(strsplit(alleles, ", "), ~ .[[1]]),
+         allele2=map_chr(strsplit(alleles, ", "), ~ if(length(.) < 2) { .[[1]] } else { .[[2]]} )) %>%
+  mutate(allele1=gsub("^.*\\*", "", allele1)) %>%
+  mutate(allele2=gsub("^.*\\*", "", allele2)) %>%
+  mutate(allele1_trunc=gsub("^([0-9]{2}:[0-9]{2}).*", "\\1", allele1)) %>%
+  mutate(allele2_trunc=gsub("^([0-9]{2}:[0-9]{2}).*", "\\1", allele2))
+
+hla_b2 <- hla_b2 %>%
+  mutate(site=ifelse(ID %in% clin_ch$ID, "CH", ifelse(ID %in% clin_es$ID, "ES", ifelse(ID %in% clin_eg$ID, "EG", "Unknown"))))
+
+hla_l_b2 <- hla_b2 %>% mutate(homozygous=allele1 == allele2) %>%
+         select(ID, locus, homozygous, allele1, allele2) %>%
+         pivot_longer(cols=c(allele1, allele2), names_to="allele_n", values_to="allele_v") %>%
+         mutate(allele_trunc=map_chr(allele_v, ~ gsub("^([0-9]{2}:[0-9]{2}).*", "\\1", .))) %>%
+         mutate(allele_full=paste0(locus, "*", allele_v)) %>%
+         mutate(allele_trunc_full=paste0(locus, "*", allele_trunc))
+```
+
+```{r clean_up_patients}
+patients <- data.frame(Patient_ID=unique(hla$Patient_ID), stringsAsFactors=FALSE)
+patients <- merge(patients, clin  %>% 
+  mutate(BMI=as.numeric(BMI), weight=as.numeric(.[["Weight [kg]"]])) %>% 
+  mutate(CRP=as.numeric(gsub(",", ".", .data[["CRP (C-reactive protein) [mg/l]"]]))) %>%
+  select(Patient_ID, icu, intub, troponine, troponine_max, tropo, tropo_max, who, who.max,
+  MCA_big, MCA_small,
+  age=Age,
+  sex=Sex,
+  weight, BMI, CRP
+  )  %>% filter(!duplicated(Patient_ID)) %>% mutate(age=as.numeric(age))
+  , by="Patient_ID")
+patients_b1 <- patients
+write_tsv(patients, path="patients_dupa")
+
+set.seed(20201023)
+train <- sample(patients$Patient_ID, 2/3 * length(patients$Patient_ID))
+test <- setdiff(patients$Patient_ID, train)
+```
+
+```{r ds1_association,cache=TRUE}
+traits <- c("icu", "intub", "tropo", "troponine", "who", "MCA_big")#, "MCA_small")
+res_all   <- run_assoc_test_new(hla, traits, patients=patients_b1, id="Patient_ID")
+res_train <- run_assoc_test_new(hla %>% filter(Patient_ID %in% train), traits, patients=patients_b1, id="Patient_ID")
+res_test  <- run_assoc_test_new(hla %>% filter(Patient_ID %in% test), traits, patients=patients_b1, id="Patient_ID")
+hla_all   <- merge(hla, patients, by="Patient_ID")
+
+
+res_all_summary   <- get_assoc_summary_new(res_all, min_freq, min_patient)
+res_train_summary <- get_assoc_summary_new(res_train, min_freq, min_patient)
+res_test_summary  <- get_assoc_summary_new(res_test, min_freq, min_patient)
+
+sex_traits <- c("sex", "age", "weight", "BMI")
+res_sex <- run_assoc_test_new(hla, sex_traits, patients=patients_b1, id="Patient_ID", log=FALSE)
+res_sex_summary <- get_assoc_summary_new(res_sex, min_freq, min_patient)
+```
+
+```{r ds1_viral_load_association}
+traits <- c("First PCR viral load", "Est. peak viral load (SA)", "Est. Peak (Bayes)")
+traits <- c("pcr_measurement_01", "est_peak_bayes")
+res_vl <- run_assoc_test_new(hla, traits, patients=viral_load, id="Patient_ID", allele1="allele1_trunc", allele2="allele2_trunc", log=FALSE)
+res_vl_summary <- get_assoc_summary_new(res_vl, min_freq, min_patient)
+res_all <- c(res_all, res_vl)
+res_all_summary   <- get_assoc_summary_new(res_all, min_freq, min_patient)
+
+patients_b1 <- merge(patients_b1, viral_load %>% select("Patient_ID", pcr_measurement_01, est_peak_bayes, est_peak_SA), by="Patient_ID", all.x=TRUE)
+```
+
+```{r ds2_associations,cache=TRUE}
+res_b2_ch <- run_assoc_test_new(hla_b2, c("ICU", "TropoT", "intub"), patients=clin_ch, id="ID")
+res_b2_ch_summary <- get_assoc_summary_new(res_b2_ch, min_freq, min_patient)
+
+res_b2_es <- run_assoc_test_new(hla_b2, c("Hospitalization", "ICU", "intub", "Severity", "sevPn"),
+  patients=clin_es %>% mutate(sevPn=ifelse(.data[["Clinical symptons"]] == "Severe pneumonia", "YES", "NO")))
+res_b2_es_summary <- get_assoc_summary_new(res_b2_es, min_freq, min_patient)
+```
+
+
+
+
+
+# Notes
+
+In this report version, following `Patient_ID`s were excluded: 
+
+`r patient_IDs_to_exclude %>% paste(collapse=", ")`
+
+Furthermore, all Granada samples were also removed.
+
+In this version of the report, the viral loads have been added to be used
+for candidate selection in data set 1. That is, the significant (at p <
+  0.05) associations between viral load and HLA were used to include
+HLA alleles for validation.
+
+# Methods
+
+## Association test
+
+For testing the association of the HLA data with the outcomes, we have used
+the package HIBAG [@zheng2014hibag] with a dominant model. Alleles with a frequency 
+lower than `r min_freq <- 0.05;min_freq` or present in fewer than `r min_patient <- 5;min_patient`
+were ignored.
+
+Following outcomes were tested: 
+
+ * model: `r model <- "dominant" ; model`
+ * association with:
+    * ICU 
+    * intubation
+    * death
+    * troponine levels (both as continuous and threshold > 14 ng/l)
+    * WHO scores (both as the WHO score at admittance and maximum WHO score over time)
+    * composite score: ICU + intubation + death + troponine ("`MCA_big`")
+    * composite score: ICU + intubation + death ("`MCA_small`")
+ * Data sets:
+    * data set 1 (DS1): Berlin cohort
+    * data set 2 (DS2): Swiss and Spanish cohorts
+    * data set 3 (DS3): RNA-Seq based data set
+
+
+# Response variables
+
+## Troponine levels vs other predictors
+
+We found that troponine levels differ significantly between groups of
+patients defined by either of ICU, intubation status or WHO score (p.value
+< 0.001 in one-way ANOVA with log(troponine level) as response).
+
+```{r fig.width=10}
+par(mfrow=c(1,3))
+beeswarm(troponine ~ icu, data=patients, log=TRUE, pch=19, col="#666666")
+beeswarm(troponine ~ intub, data=patients, log=TRUE, pch=19, col="#666666")
+beeswarm(troponine ~ who, data=patients, log=TRUE, pch=19, col="#666666")
+```
+
+**Table.** Results of one-way ANOVA for the three outcomes (ICU, intubation
+status and WHO score) tested.
+
+```{r results="markdown"}
+set <- c("icu", "intub", "who")
+ret <- map_dfr(set, ~ aov(log(patients$troponine) ~ factor(patients[[.x]])) %>% broom::tidy() %>% slice(1) %>% mutate(term=.x))
+pander(ret, digits=2)
+```
+
+## ICU score vs other predictors
+
+ICU score was significantly associated with other outcomes (binary
+troponine levels, ICU, intubation status), $\chi^2$ test at p < 0.05.
+
+
+```{r fig.width=10}
+par(mfrow=c(1,3))
+beeswarm(who ~ tropo, data=patients, pch=19, col="#666666")
+beeswarm(who ~ icu, data=patients, pch=19, col="#666666")
+beeswarm(who ~ intub, data=patients, pch=19, col="#666666")
+```
+
+**Table.** Results of the $\chi^2$ test with WHO score as response
+variable.
+
+```{r results="markdown"}
+set <- c("tropo", "intub", "who")
+map_dfr(set, ~ chisq.test(table(patients$who, patients[[.x]])) %>% broom::tidy() %>% slice(1) %>% mutate(term=.x)) %>%
+pander(digits=2)
+```
+
+## MCA score (big)
+
+```{r fig.width=10}
+par(mfrow=c(1,3))
+beeswarm(MCA_big ~ tropo, data=patients, pch=19, col="#666666")
+beeswarm(MCA_big ~ icu, data=patients, pch=19, col="#666666")
+beeswarm(MCA_big ~ intub, data=patients, pch=19, col="#666666")
+```
+
+
+## MCA score (small)
+
+```{r fig.width=10}
+par(mfrow=c(1,3))
+beeswarm(MCA_small ~ tropo, data=patients, pch=19, col="#666666")
+beeswarm(MCA_small ~ icu, data=patients, pch=19, col="#666666")
+beeswarm(MCA_small ~ intub, data=patients, pch=19, col="#666666")
+```
+
+
+
+
+## Correlation troponine / troponine max
+
+```{r}
+plot(patients$troponine, patients$troponine_max,
+  xlab="Troponine",
+  ylab="Max. troponine",
+  log="xy",
+  bty="n")
+```
+
+# HLA associations in Data Set 1
+
+## Data set overview
+
+**Table.** Summary overview of the data set 1 patients. 
+
+```{r, results="markdown"}
+ds1_full_patient_df <- hla_all %>% 
+  select(Patient_ID, locus, alleles, icu:BMI) %>% 
+  pivot_wider(id_cols=Patient_ID, names_from=locus, values_from=alleles) %>% { right_join(patients_b1, ., by="Patient_ID") }
+
+write_xlsx(ds1_full_patient_df, path=paste0("full_patient_list_", Sys.Date(), ".xlsx"))
+
+tmp <- ds1_full_patient_df %>% select(Patient_ID:BMI) %>% summary_colorDF %>%
+  rename("Missing"=NAs, "Unique values"=unique, Variable=Col, "Variable type"=Class) 
+write_xlsx(tmp, path=paste0("ds1_summary_", Sys.Date(), ".xlsx"))
+tmp %>% pander(split.tables=Inf)
+```
+
+
+```{r summaries}
+by.j <- c("allele", "parameter")
+res_summary <- full_join(res_train_summary, res_test_summary, by=by.j, suffix=c("train", "test"))
+res_summary <- full_join(res_summary, res_all_summary, by=by.j, suffix=c("", "all"))
+```
+
+## Results summary
+
+**Table.** Results of the HLA association testing for all response variables in full DS1 at p~adj~ < 0.5. 
+
+```{r, results="markdown"}
+res_all_sign <- res_all_summary %>% filter(p.val < 0.05 & !is.na(p.adj)) %>% 
+  filter(!grepl("(peak|pcr|viral load|Peak)", parameter)) %>%
+  arrange(p.val)
+res_all_sign %>% filter(p.adj < 0.05) %>%
+  select(allele, parameter, N=.data[["[-/h,h/h]"]], p.val, p.adj) %>% arrange(p.adj) %>% 
+  pander(digits=2, split.tables=Inf)
+res_all_sign %>% select(allele, parameter, N=.data[["[-/h,h/h]"]], p.val, p.adj) %>%
+  write_xlsx(path="../manuscripts/supplementary_table_candidates.xlsx")
+
+
+
+```
+
+## Individual results
+
+```{r}
+dt_show <- function(x, param) {
+  x %>% 
+  filter(freqtrain >= min_freq) %>%
+  filter(parameter == param) %>%
+  filter(!is.na(p.adjtrain)) %>%
+  #mutate("confirmed"=ifelse(!is.na(p.valtrain) & !is.na(p.valtest) & p.valtrain < 0.05 & p.valtest < 0.05, "Confirmed", "")) %>%
+  arrange(p.valtrain) %>%
+  select(Locus=locus, Allele=allele, Frequency=freq, "p (train)"=p.valtrain, "p (test)"=p.valtest, "p (all)"=p.val, "q (all)"=p.adj) %>%
+  datatable(class = 'cell-border stripe') %>%
+  formatRound(digits=2, columns=c("Frequency", "p (train)", "p (test)", "p (all)", "q (all)"))
+
+}
+```
+
+
+### Table with individual results {.tabset}
+
+**Table.** Results of the HLA association testing. Only alleles with at
+least `r min_freq*100`% frequency and present in at least `r min_patient`
+individuals in the training test were included.
+
+
+#### ICU
+
+```{r, results="markdown"}
+res_summary %>% dt_show("icu")
+```
+
+#### Intubation
+
+```{r, results="markdown"}
+res_summary %>% dt_show("intub")
+```
+
+#### WHO score
+
+```{r, results="markdown"}
+res_summary %>% dt_show("who")
+```
+
+#### Troponine
+
+
+```{r, results="markdown"}
+res_summary %>% dt_show("troponine")
+```
+
+#### Troponine above threshold
+
+```{r, results="markdown"}
+res_summary %>% dt_show("tropo")
+```
+
+#### WHO max
+
+```{r, results="markdown"}
+res_summary %>% dt_show("who.max")
+```
+
+#### MCA big
+
+```{r, results="markdown"}
+res_summary %>% dt_show("MCA_big")
+```
+
+#### MCA small
+
+```{r, results="markdown"}
+res_summary %>% dt_show("MCA_small")
+```
+
+
+### {-}
+
+
+
+
+
+
+
+## Train vs Test
+
+```{r}
+p1 <- "p.valtrain"
+p2 <- "p.valtest"
+```
+
+Spearman correlation between p-values: 
+rho=`r cor( res_summary[[p1]], res_summary[[p2]], method="s", use="p") %>% format(digits=2)`.
+
+```{r trainvstest_ttest,fig.width=6,fig.height=6}
+tmp <- res_summary %>% arrange(desc(.data[[p1]] * .data[[p2]]))
+plot(
+  tmp[[p1]],
+  tmp[[p2]],
+  xlab="Train",
+  ylab="Test",
+  log="xy",
+  bty="n",
+  pch=19,
+  col="#CCCCCCCC"
+)
+abline(h=0.05, col="red")
+abline(v=0.05, col="red")
+text(  
+  tmp[[p1]],
+  tmp[[p2]],
+  paste0(tmp$allele, "\n", tmp$parameter),
+  col=ifelse(tmp[[p1]] < .05 & tmp[[p2]] < .05, "red", "grey"),
+  cex=.8
+  )
+```
+
+
+## Confirmed results
+
+**Table.** Results of the training / test set confirmation of association
+analysis in DS1 (Berlin).  All associations significant in at least one of
+the tests are shown for the alleles for
+which at least one confirmed association was shown.
+
+```{r results="markdown"}
+sel_alleles <- res_summary %>% filter(p.valtrain < .05 & p.valtest < .05) %>%
+  pull(allele) %>% unique
+res_summary %>% filter(allele %in% sel_alleles) %>%
+  filter(p.valtrain < .05 | p.valtest < .05 | p.val < .05) %>%
+  arrange(allele, p.val) %>%
+  select(allele, parameter, "param. type"=type, freq, "[-/-]", "[-/h,h/h]", "T.[-/-]", "T.[-/h,h/h]", 
+    "p(test)"=p.valtest,
+    "p(train)"=p.valtrain,
+    "p(full)"=p.val,
+    "p(adj)"=p.adj) %>%
+  pander(split.tables=Inf, digits=2)
+```
+
+
+
+## Allele candidates
+
+**Table.** Following alleles have been selected as candidates for validation.
+
+```{r results="markdown"}
+res_summary %>% filter(p.val < .05 & !is.na(p.adj)) %>%
+mutate(confirmed=ifelse(!is.na(p.adjtrain) & !is.na(p.adjtest) & !is.na(p.valtrain) & !is.na(p.valtest) & p.valtrain < .05 & p.valtest < .05, "yes", "no")) %>%
+  arrange(p.val) %>%
+  mutate(
+    freq=format(freq, digits=2),
+    p.val=format.pval(p.val, digits=2),
+    p.adj=format.pval(p.adj, digits=2)) %>%
+  select(Allele=allele, Parameter=parameter, Frequency=freq, "[-/-]", "[-/h,h/h]",
+    "P.value"=p.val,
+    "FDR"=p.adj,
+    confirmed) %>% 
+    filter(!grepl("(peak|pcr)", Parameter)) %>%
+    mutate(Parameter=c(intub="Intubation", icu="ICU", MCA_big="composite",
+    tropo="troponine (cat.)", troponine="troponine (cont.)", who="WHO score")[Parameter]) %>%
+    pander(split.tables=Inf)
+  #datatable(class = 'cell-border stripe') %>%
+  #formatRound(digits=2, columns=c("Frequency", "T.[-/-]", "T.[-/h,h/h]", "p(train)", "p(test)", "p(all)", "p(adj)"))
+```
+
+
+**Fig.** Association between alleles and response parameters in DS1.
+Each dot represents one allele / response parameter association.
+Left, association with categorical response parameter (ICU status,
+intubation status and troponine levels raised above 14 ng/l); right,
+associations with continuous parameters (troponine level, WHO score and
+composite score). Y axis represents the negative logarithm of the p-value
+obtained from corresponding test (left: Fisher's exact test; right:
+t-test). Colors correspond to the response parameters. Sizes of
+dots correspond to the calculated effect size of the associations (left:
+Cramer's v, right: Cohen's d). Faint lines correspond to the selection
+thresholds (vertical line: frequency selection threshold of `r min_freq`;
+horizontal line: p-value threshold of 0.05).
+
+```{r fig.width=15,fig.height=8}
+require(cowplot)
+require(ggplot2)
+require(hrbrthemes)
+require(ggrepel)
+set.seed(123)
+tmp <- res_all_summary %>% 
+  filter(type == "categorical" & parameter != "tropo_max") %>% 
+  mutate(Parameter=c(intub="Intubation", icu="ICU", tropo="Troponin T hs > 14ng/l")[parameter]) %>%
+  mutate(Effect=E, label="") %>% 
+  arrange(freq < min_freq, p.val) %>% 
+  mutate(label=ifelse(1:n() > 3, "", allele))
+
+g1 <- ggplot(tmp %>% filter(!is.na(p.val)), aes(x=freq, y=-log10(p.val), size=Effect, group=Parameter)) + 
+  geom_point(aes(col=Parameter), alpha=0.5) + 
+  geom_hline(yintercept=-log10(.05), col="grey") +
+  geom_vline(xintercept=min_freq, col="grey") +
+  scale_color_ipsum()  + geom_label_repel(aes(label=label), show.legend=FALSE) +
+  xlab("Frequency")  + ggtitle("Categorical")
+
+tmp <- res_all_summary %>% 
+  filter(type != "categorical" & parameter %in% c("who", "troponine", "MCA_big")) %>% 
+  mutate(Effect=abs(E), label="") %>% 
+  mutate(Parameter=c(MCA_big="Composite score", troponine="Troponin T hs [ng/l]", who="WHO score")[parameter]) %>%
+  arrange(freq < min_freq, p.val) %>% 
+  mutate(label=ifelse(1:n() > 3, "", allele))
+
+g2 <- ggplot(tmp %>% filter(!is.na(p.val)), aes(x=freq, y=-log10(p.val), size=Effect, group=Parameter)) + 
+  geom_point(aes(col=Parameter), alpha=0.5) + 
+  geom_hline(yintercept=-log10(.05), col="grey") +
+  geom_vline(xintercept=min_freq, col="grey") +
+  scale_color_ipsum()  + geom_label_repel(aes(label=label), point.padding=0, box.padding=2, max.iter=5000, show.legend=FALSE) +
+  xlab("Frequency")  + ggtitle("Continuous")
+plot_grid(g1, g2)
+```
+
+
+
+# Validation with Data Set 2
+
+## Characterization of the cohorts in Data Set 2
+
+ * Switzerland:
+    * 21 patients, 9 in the ICU
+    * troponine levels determined in all but 4 patients
+    * CRP, creatinine, creatinine clearance in all but 3 patients
+    * procalcitonine in all but 4
+
+ * Granada (REMOVED):
+    * 18 patients, 0 in the ICU
+    * creatinine, CRP
+    * troponine in all but 3 patients
+
+ * Sevilla:
+    * 120 patients, 4 in the ICU
+    * clinical symptoms: asymptomatic/mild/pneumonia/severe pneumonia
+    * sparse additional data
+
+
+**Fig.** Measured variables in Swiss data set in dependence on the ICU
+status.
+
+
+```{r swiss_tropo,fig.width=11,fig.height=4}
+par(mfrow=c(1, 4))
+showgene(clin_ch$crp, clin_ch$ICU, ylab="CRP")
+showgene(clin_ch$troponint, clin_ch$ICU, ylab="troponint")
+showgene(clin_ch$creatinine, clin_ch$ICU, ylab="Creatinine", ylim=c(50, 150))
+showgene(clin_ch$procalcitonine, clin_ch$ICU, ylab="Procalcitonine", log=TRUE) 
+```
+
+
+## Data set 2 HLA typing results
+
+```{r batch2_hlatyping_by_cohort}
+.icu   <- res_all$icu %>% reduce(rbind)
+.intub <- res_all$intub %>% reduce(rbind)
+show_ds2 <- function(x, param, pval.thr=1) {
+  x %>% filter(!is.na(p.adj) & p.val < pval.thr) %>% arrange(p.val) %>%
+  filter(parameter == param) %>%
+  mutate(batch1icu   =.icu$p.val[ match(allele, .icu$allele) ]) %>%
+  mutate(batch1intub =.intub$p.val[ match(allele, .icu$allele) ]) %>%
+  select(allele, Frequency=freq, "DS2 p value (ICU)"=p.val, "DS1 p value (ICU)"=batch1icu, "DS1 p value (Intubation)"=batch1intub) %>%
+  pander(split.tables=Inf,digits=2)
+}
+```
+
+### Table: Associations in the DS2 cohorts {.tabset}
+
+#### Switzerland, ICU
+
+```{r, results="markdown"}
+res_b2_ch_summary %>% show_ds2("ICU")
+```
+
+#### Switzerland, Troponine
+
+
+```{r results="markdown"}
+res_b2_ch_summary %>% show_ds2("TropoT")
+```
+
+#### Sevilla, ICU
+
+```{r, results="markdown"}
+res_b2_es_summary %>% show_ds2("ICU")
+```
+
+#### Sevilla, Severity
+
+```{r, results="markdown"}
+res_b2_es_summary %>% show_ds2("Severity")
+```
+
+
+#### Sevilla, Hospitalization
+
+```{r, results="markdown"}
+res_b2_es_summary %>% show_ds2("Hospitalization")
+```
+
+#### Sevilla, Severe pneumonia
+
+```{r, results="markdown"}
+res_b2_es_summary %>% show_ds2("sevPn")
+```
+
+
+### {-}
+
+
+## Data set 2 hla typing results: ICU (in all 3 cohorts)
+
+**Table.** Statistically significant (at uncorrected p < 0.05) associations
+between ICU and HLA in full Data Set 2.  Only alleles with frequency above 
+`r min_freq` and in at least `r min_patient` were considered.
+
+```{r batch2_hlatyping}
+clin_batch2 <- rbind(clin_ch %>% select(ID, ICU, intub, troponine=TropoT), clin_es %>% select(ID, ICU, intub) %>% mutate(troponine=NA))
+hla_batch2  <- merge(hla_b2, clin_batch2, by="ID")
+res_batch2  <- run_assoc_test_new(hla_batch2, c("ICU", "intub", "troponine"), patients=NULL, allele1="allele1_trunc", allele2="allele2_trunc", id="ID")
+res_batch2_summary <- get_assoc_summary_new(res_batch2, min_freq, min_patient)
+```
+
+
+```{r, results="markdown"}
+res_batch2_summary %>% 
+  filter(!is.na(p.adj) & p.val < 0.05) %>%
+  arrange(p.val) %>%
+  select(allele, 2:5, "DS2 p value"=p.val) %>%
+  pander(split.tables=Inf,digits=2)
+```
+
+
+
+
+
+
+
+
+
+
+# Validation with Data Set 3
+
+
+```{r}
+gse_covar <- read.table("meta_data/GSE157103_covariate_file.txt") %>% 
+             rename(ID=label, intub=mechanical_ventilation) %>% 
+             select(-filename, -md5, -GEO_Accession..exp., -Sample.Name, -associated_controlled.vocabulary_terms, -Experiment, -disease_state)
+
+gse_opti <- read_xlsx("meta_data/s_2020_Heidecker_GSE157103.xlsx", skip=1) %>% select(ID=1, allele="Optitype Hla Type")
+gse_opti <- gse_opti %>% separate_rows(allele, sep=";") %>% mutate(locus=gsub("\\*.*", "", allele)) %>% 
+  group_by(locus, ID) %>% summarise(allele1=allele[1], allele2=allele[2], locus=locus[1]) %>% arrange(ID) %>%
+  merge(gse_covar %>% select(ID, icu, DM, sex, intub, group), by="ID") %>% 
+  filter(group == "COVID_19") %>%
+  mutate(allele1=gsub(".*\\*", "", allele1), allele2=gsub(".*\\*", "", allele2)) %>%
+  arrange(ID, locus)
+
+gse <- read_tsv("../rnaseq_GSE157103_arcas/rnaseq_GSE157103_arcas_alleles_20201111.tsv")
+
+
+
+gse_hla <- merge(gse, gse_covar, by="ID") %>% 
+  filter(group == "COVID_19") %>%
+  mutate(allele1=gsub("^([0-9]+:[0-9]+):[0-9]*$", "\\1", gsub(".*\\*", "", allele1)), allele2=gsub("^([0-9]+:[0-9]+):[0-9]*$", "\\1", gsub(".*\\*", "", allele2))) %>%
+  mutate(locus=gsub("^([ABC])$", "HLA_\\1", locus)) %>%
+  arrange(ID, locus)
+
+
+gse_hla_l <- gse_hla %>% select(ID, locus, allele1, allele2) %>%
+mutate(homozygous=allele1 == allele2) %>%
+pivot_longer(cols=allele1:allele2, names_to="allele_n", values_to="allele") %>% 
+mutate(allele_trunc_full=gsub("^([ABC]\\*)", "HLA_\\1", paste0(locus, "*", allele)))
+```
+
+```{r arcas_vs_opti}
+## there are some annotation differences 
+merged <- merge(gse_opti, gse_hla, by=c("ID", "locus")) %>% select(ID, locus, starts_with("allele"))
+
+problem <- merged %>% group_by(ID, locus) %>% summarise(problem=!setequal(c(allele1.x, allele2.x), c(allele1.y, allele2.y))) %>%
+  filter(problem)
+
+#merged %>% filter(paste0(ID, locus) %in% paste0(problem$ID, problem$locus))
+```
+
+
+```{r gse_other_vars}
+#vars <- c("icu", "intub", "DM", "sex", "fibrinogen", "Charlson_score", "apacheii", "sofa")
+vars <- c("icu", "intub")
+#gse_loci <- set_names(unique(gse_hla$locus))
+gse_loci <- set_names(unique(gsub(" .*", "", res_all_sign$allele)))
+gse_res <- run_assoc_test_new(gse_hla, vars, patients=NULL, allele1="allele1", allele2="allele2")
+gse_res_summary <- get_assoc_summary_new(gse_res, min_freq, min_patient)
+#gse_res_summary <- gse_res_summary %>% filter(allele %in% res_all_sign$allele & !is.na(p.adj))
+
+
+```
+
+## RNA-Seq results
+
+**Table.** Results of the Data Set 3 (RNA-Seq) association testing significant at
+p < 0.05 (Fisher test). Only alleles with a minimal frequency of 
+`r min_freq` and present in at least `r min_patient` individuals were
+tested.
+
+```{r gse_icu,results="markdown"}
+res_b1 <- res_all$icu %>% reduce(rbind)
+res_b2 <- res_batch2_summary 
+
+gse_res_summary %>% 
+	filter(!is.na(p.adj) & p.val < 0.05) %>% arrange(p.val) %>%
+  mutate(pval_b1=res_b1$p.val[ match(allele, res_b1$allele) ]) %>%
+  mutate("pval_b1 (intub)"=(res_all$intub %>% reduce(rbind))$p.val[ match(allele, res_b1$allele) ]) %>%
+  mutate(pval_b2=res_b2$p.val[ match(allele, res_b2$allele) ]) %>%
+  pander(split.tables=Inf, digits=2)
+```
+
+
+# Final analysis with randomization test
+
+
+```{r randomization,eval=FALSE}
+library(BiocParallel)
+options(MulticoreParam=MulticoreParam(workers=6))
+
+N <- 1000
+traits_b1 <- c("icu", "intub", "tropo", "troponine", "who", "MCA_big")#, "MCA_small")
+traits_b2 <- c("ICU", "intub", "troponine")
+traits_b3 <- c("icu", "intub")
+for(j in 1:10) {
+  message(j)
+res_rand <- bplapply(1:N, function(i) {
+
+  hla.tmp <- hla
+    patients.tmp <- patients_b1
+  patients.tmp$Patient_ID <- sample(patients.tmp$Patient_ID)
+  res_all.tmp   <- run_assoc_test_new(hla.tmp, traits_b1, patients=patients.tmp, id="Patient_ID")
+  res_all_summary.tmp   <- get_assoc_summary_new(res_all.tmp, min_freq, min_patient)
+  res_all_sign.tmp <- res_all_summary.tmp %>% filter(p.val < 0.05 & !is.na(p.adj)) %>% arrange(p.val)
+
+  ord <- sample(1:nrow(hla_batch2))
+  hla_batch2.tmp <- hla_batch2 %>% mutate_at(all_of(traits_b2), ~ .[ord])
+  res_batch2.tmp <- run_assoc_test_new(hla_batch2.tmp, traits_b2, patients=NULL, allele1="allele1_trunc", allele2="allele2_trunc")
+  res_batch2_summary.tmp <- get_assoc_summary_new(res_batch2.tmp, min_freq, min_patient) %>%
+    filter(!is.na(p.adj)) 
+
+  ord <- sample(1:nrow(gse_hla))
+  gse_hla.tmp <- gse_hla %>% mutate_at(all_of(traits_b3), ~ .[ord])
+  gse_res.tmp <- run_assoc_test_new(gse_hla.tmp, traits_b3, patients=NULL, allele1="allele1", allele2="allele2")
+  gse_res_summary.tmp <- get_assoc_summary_new(gse_res.tmp, min_freq, min_patient) %>% 
+    filter(!is.na(p.adj))
+
+  res_confirmed.tmp <- merge(res_batch2_summary.tmp, gse_res_summary.tmp, by=c("locus", "allele"), suffixes=c("_b2", "_b3"))
+  res_confirmed.tmp <- merge(res_all_sign.tmp, res_confirmed.tmp) %>%
+    filter(p.val_b2 | p.val_b3 < 0.05) %>% 
+    select(locus, allele, starts_with("parameter"), starts_with("p.val"))
+  return(res_confirmed.tmp)
+})
+
+saveRDS(res_rand, file=paste0("res_rand_1000_", j, ".rds"))
+}
+
+
+
+```
+
+
+
+
+
+
+
+
+
+**Table.** Final analysis results. Candidates selected from Data Set 1 were
+compared to the association results in the validation Data Sets 2 and 3.
+Only alleles with frequency > `r min_freq` and present in more than
+`r min_patient` individuals in all three data sets were considered.
+P-value was obtained from a randomization testing procedure (replicating
+the selection and validation process with randomly matched genotypes and
+clinical data). 
+
+```{r final_analysis, results="markdown"}
+res_confirmed <- merge(res_batch2_summary %>% filter(allele %in% res_all_sign$allele & !is.na(p.adj)), 
+	gse_res_summary %>% filter(allele %in% res_all_sign$allele & !is.na(p.adj)), by="allele", suffixes=c("_b2", "_b3"), all=TRUE)
+res_confirmed <- merge(res_all_sign, res_confirmed, by="allele") %>%
+    select(locus, allele, starts_with("freq"), starts_with("parameter"), starts_with("p.val")) 
+res_rand <- list.files(path=".", pattern="res_rand_1000.*") %>% map(readRDS) %>% reduce(c)
+res_final <- res_confirmed %>% 
+             group_by(allele) %>% 
+             filter(p.val    == min(p.val)) %>% 
+             filter(p.val_b2 == min(p.val_b2)) %>% 
+             filter(is.na(p.val_b3) | p.val_b3 == min(p.val_b3)) %>% 
+             rowwise %>% 
+             mutate(p.val_rand=sum(map_lgl(res_rand, ~ 
+              any(.x$p.val <= p.val & (is.na(p.val_b3) | is.na(.x$p.val_b3) | .x$p.val_b3 <= p.val_b3) & .x$p.val_b2 <= p.val_b2)))/length(res_rand)) %>% 
+             ungroup %>% mutate(p.val_rand_adj=p.adjust(p.val_rand))
+res_final %>%
+  select(allele, starts_with("freq"), starts_with("p.val")) %>%
+  arrange(gsub("HLA", "AAAA", allele)) %>%
+      pander(split.tables=Inf, digits=2)
+```
+
+
+**Fig.** Associations of HLA C\*04:01 with categorical response variables.
+Each panel shows the difference between patients who were carrying the
+allele (HLA C\*04:01 status: Present) and patients who did not carry the allele
+(HLA C\*04:01 status: Absent).
+Colors correspond to variable status. Vertical axis shows the absolute number of
+patients. D1 - DS3: data sets 1 - 3. 
+
+```{r hlac0401_associations, fig.width=15,fig.height=6}
+
+tmp <- rbind(
+  res_all_summary %>% mutate(DS="DS1") %>% filter(parameter != "tropo_max"),
+  res_batch2_summary %>% mutate(DS="DS2"),
+  gse_res_summary %>% mutate(DS="DS3"))  %>%
+    filter(type == "categorical" & allele == "HLA_C 04:01") %>%
+    mutate(Parameter=c(intub="Intubation", ICU="ICU", icu="ICU", tropo="Troponin T hs > 14ng/l")[parameter]) 
+    
+    
+tmp_long <- tmp %>%
+    mutate(Yes_Present  = .data[["T.[-/h,h/h]"]] * .data[["[-/h,h/h]"]],
+           Yes_Absent   = .data[["T.[-/-]"]] * .data[["[-/-]"]],
+           No_Present  = .data[["[-/h,h/h]"]] - Yes_Present, 
+           No_Absent   = .data[["[-/-]"]] - Yes_Absent) %>% 
+  pivot_longer(cols=Yes_Present:No_Absent, names_to=c("Parameter Status", "HLA C*04:01 Status"), names_sep="_", values_to="N") %>%
+  mutate(id=paste(DS, Parameter, .data[["HLA C*04:01 Status"]]), param=paste(DS, Parameter)) %>%
+  mutate("Parameter Status"=paste(Parameter, .data[["Parameter Status"]], sep=": "))
+
+ggplot(tmp_long, aes(x=.data[["HLA C*04:01 Status"]], y=N, fill=.data[["Parameter Status"]])) + geom_bar(stat="identity") + facet_grid(~ param) + theme(strip.background =element_rect(fill="white")) + scale_fill_brewer(palette="Paired")  
+```
+
+**Fig.** Associations of HLA C\*04:01 with categorical response variables.
+Each panel shows the difference between patients who were carrying the
+allele (HLA C\*04:01 status: Present) and patients who did not carry the allele
+(HLA C\*04:01 status: Absent).
+Colors correspond to variable status. Vertical axis shows the frequencies of
+patients. D1 - DS3: data sets 1 - 3. 
+
+
+```{r hlac0401_associations_2, fig.width=15,fig.height=6}
+tmp_long <- tmp %>%
+    mutate(Yes_Present  = .data[["T.[-/h,h/h]"]],# * .data[["[-/h,h/h]"]],
+           Yes_Absent   = .data[["T.[-/-]"]],# * .data[["[-/-]"]],
+           No_Present  = 1 - .data[["T.[-/h,h/h]"]], #.data[["[-/h,h/h]"]] - Pos_Present,
+           No_Absent   = 1 - .data[["T.[-/-]"]]#.data[["[-/-]"]] - Pos_Absent
+           ) %>%
+  pivot_longer(cols=Yes_Present:No_Absent, names_to=c("Parameter Status", "HLA C*04:01 Status"), names_sep="_", values_to="Frequency") %>%
+  mutate(id=paste(DS, Parameter, .data[["HLA C*04:01 Status"]]), param=paste(DS, Parameter)) %>%
+  mutate("Parameter Status"=paste(Parameter, .data[["Parameter Status"]], sep=": "))
+
+ggplot(tmp_long, aes(x=.data[["HLA C*04:01 Status"]], y=Frequency, fill=.data[["Parameter Status"]])) + geom_bar(stat="identity") + facet_grid(~ param) + theme(strip.background =element_rect(fill="white")) + scale_fill_brewer(palette="Paired")  
+
+
+```
+
+# Analysis of the joined data set
+
+```{r joined_data_set}
+batch1_hla <- hla_all %>% mutate(INTUB=ifelse(intub=="0", "no", "yes")) %>% select(ID=Patient_ID, locus, allele1=allele1_trunc, allele2=allele2_trunc, ICU=icu, INTUB)
+batch2_hla <- hla_batch2 %>% select(ID, locus, allele1=allele1_trunc, allele2=allele1_trunc, ICU, INTUB=intub)
+batch3_hla <- gse_hla %>% select(ID, locus, allele1, allele2, ICU=icu, INTUB=intub)
+batch123_hla <- rbind(batch1_hla, batch2_hla, batch3_hla) %>% mutate(ICU=toupper(ICU), INTUB=toupper(INTUB)) %>% filter(!is.na(ICU))
+
+batch123_stat <- batch123_hla %>% group_by(locus) %>% summarize(n=n())
+batch123_loci <- batch123_stat %>% filter(n > 100) %>% pull(locus) %>% set_names()
+
+res123 <- run_assoc_test_new(batch123_hla, c("ICU", "INTUB"), patients=NULL, allele1="allele1", allele2="allele2", id="ID")
+res123_summary <- get_assoc_summary_new(res123, min_freq, min_patient)
+```
+
+**Table.** Results of the joined analysis of association with ICU status
+for all three data sets. Alleles present in fewer than `r min_patient`
+individuals or at a frequency lower than `r min_freq` were not tested for
+association.
+
+```{r res123_summary_icu, results="markdown"}
+res123_summary %>%
+	filter(!is.na(p.adj) & p.val < .05) %>%
+  filter(parameter == "ICU") %>%
+  select(-type) %>%
+      arrange(p.val) %>%
+      pander(split.tables=Inf, digits=2)
+
+res123_summary %>% 
+	filter(!is.na(p.adj) & p.val < .05) %>%
+  select(-type) %>% arrange(p.val) %>%
+  write_xlsx(path="../manuscripts/supplementary_table_joined_analysis.xlsx")
+
+```
+
+**Table.** Results of the joined analysis of association with intubation status
+for data sets 1 and 3. Alleles present in fewer than `r min_patient`
+individuals or at a frequency lower than `r min_freq` were not tested for
+association.
+
+```{r res123_summary_intub, results="markdown"}
+res123_summary %>%
+	filter(!is.na(p.adj) & p.val < .05) %>%
+  filter(parameter == "INTUB") %>%
+  select(-type, -parameter) %>%
+      arrange(p.val) %>%
+      pander(split.tables=Inf, digits=2)
+```
+
+```{r joined_data_set_tropo}
+batch1_hla <- hla_all %>% select(ID=Patient_ID, locus, allele1=allele1_trunc, allele2=allele2_trunc, TROPO=troponine) %>%
+  drop_na()
+batch2_hla <- merge(clin_ch, hla_batch2) %>% mutate(TROPO=TropoT) %>%
+  select(ID, locus, allele1=allele1_trunc, allele2=allele1_trunc, TROPO)
+batch123_hla <- rbind(batch1_hla, batch2_hla)
+
+batch123_stat <- batch123_hla %>% group_by(locus) %>% summarize(n=n())
+batch123_loci <- batch123_stat %>% filter(n > 100) %>% pull(locus) %>% set_names()
+
+res123$TROPO <- run_assoc_test_new(batch123_hla, c("TROPO"), patients=NULL, allele1="allele1", allele2="allele2", id="ID")$TROPO
+res123_summary <- get_assoc_summary_new(res123, min_freq, min_patient)
+```
+
+**Table.** Results of the joined analysis of association with troponine
+levels
+for data sets 1 and 2\_ch. Alleles present in fewer than `r min_patient`
+individuals or at a frequency lower than `r min_freq` were not tested for
+association.
+
+```{r res123_summary_tropo, results="markdown"}
+res123_summary %>%
+	filter(!is.na(p.adj) & p.val < .05) %>%
+  filter(parameter == "TROPO") %>%
+  select(-type, -parameter) %>%
+      arrange(p.val) %>%
+      pander(split.tables=Inf, digits=2)
+```
+
+# Association with KIR
+
+# Association of alleles with viral load
+
+```{r}
+require(rstatix)
+foo <- merge(clin, viral_load, by="Patient_ID")
+  #rename(firstPCR="First PCR viral load", estPeakSA="Est. peak viral load (SA)", estPeakBayes="Est. Peak (Bayes)")
+wilco.icu    <- map_dfr(c("pcr_measurement_01", "est_peak_bayes"), ~ wilcox_test(foo, as.formula(paste0(.x, " ~ icu"))))
+wilco.p.icu <- set_names(wilco.icu %>% pull(p), wilco.icu %>% pull(.y.))
+wilco.ef.icu <- map_dfr(c("pcr_measurement_01", "est_peak_bayes"), ~ wilcox_effsize(foo, as.formula(paste0(.x, " ~ icu"))))
+wilco    <- map_dfr(c("pcr_measurement_01", "est_peak_bayes"), ~ wilcox_test(foo, as.formula(paste0(.x, " ~ intub"))))
+wilco.p <- set_names(wilco %>% pull(p), wilco %>% pull(.y.))
+wilco.ef <- map_dfr(c("pcr_measurement_01", "est_peak_bayes"), ~ wilcox_effsize(foo, as.formula(paste0(.x, " ~ intub"))))
+
+corTropoFirst <- cor.test(foo$pcr_measurement_01, foo$troponine, use="p", method="s")
+res_vl_sign <- res_vl_summary %>% filter(!is.na(p.adj) & p.val < .05)
+```
+
+For DS1, viral loads as well as estimated peak viral load were available.
+Notably, the viral loads were not associated with higher severity of
+symptoms. The viral loads and estimated peak viral loads were lower
+in the intubated patients, albeit not significantly
+(p-values from two-sided Wilcoxon test, respectively,
+`r format.pval(wilco.p[1], 2)` and
+`r format.pval(wilco.p[2], 2)`). 
+The estimated peak size was significantly lower in ICU patients
+(`r wilco.p.icu[2]`).
+The correlation between troponine levels and 
+the initial viral load (but not the estimated peak viral load) was
+significant and  positive, but small 
+(Spearman's $\rho$=`r format(corTropoFirst$estimate, 2)`, 
+p=`r format.pval(corTropoFirst$p.value, 2)`). Furthermore, both measures of
+viral load were significantly and negatively correlated with the composite
+score.
+
+There were 
+`r sum(res_vl_sign$p.val < .05)`
+significant associations between HLA at p < 0.05 and none significant after correction for false discovery rate.
+The HLA
+C\*04:01 allele was not significantly associated with any viral load
+variable. The alleles significantly associated with one of the viral load
+variables were not formally validated with a randomization test by either
+data set 2 or 3 given that higher viral load does not correlate with higher
+severity, but none of the alleles was significantly associated with any of
+the other tested covariates (such as ICU or intubation status)in data sets
+1-3.
+
+**Table XX.** Significant associations between viral load and HLA alleles
+in data set 1. 
+Allele, two-digit allele code; covariate, the covariate for which the
+association was tested; Frequency: allele frequency; [-/-]: number of  
+individuals not carrying the allele; [-/h,h/h]: number of individuals
+carrying the allele; Effect size: Cohen's d; 
+P value: p-value from t-test; FDR: p-value corrected for false discovery
+rate.
+
+```{r vl_associations, results="markdown"}
+res_vl_sign %>%
+  arrange(p.val) %>%
+  #filter(parameter != "Est. Peak (Bayes)") %>%
+  filter(parameter != "est_peak_SA") %>%
+  mutate(parameter=gsub(" \\(SA\\)", "", parameter)) %>%
+  mutate(parameter=c(pcr_measurement_01="First measurement",
+  est_peak_bayes="Estimated peak viral load")[parameter]) %>%
+  select(Allele=allele, Covariate=parameter,
+    Frequency=freq,
+    "[-/-]", "[-/h,h/h]",
+    "Effect size"=E,
+    "P value"=p.val,
+    "FDR"=p.adj) %>%
+  pander(digits=2, split.tables=Inf)
+```
+
+**Fig.** Viral load at first measurement was not associated significantly
+with ICU / intubation status or troponine levels.
+
+```{r viral_load_overview,fig.width=10,fig.height=4}
+vl_init <- "pcr_measurement_01"
+vl_sa   <- "est_peak_SA"
+vl_bayes <- "est_peak_bayes"
+
+vl_vars <- c(vl_init, vl_sa, vl_bayes)
+pr_vars <- c("icu", "intub", "troponine")
+foo <- merge(clin, viral_load, by="Patient_ID")
+
+#par(mfrow=c(3,3)) 
+par(mfrow=c(1,3)) 
+prnam <- c(icu="ICU status", intub="Intubation status")
+foo$intub <- c("0"="NO", "1"="YES")[foo$intub]
+
+#for(vl in vl_vars) {
+  vl <- vl_init
+  for(pr in pr_vars) {
+    if(pr == "troponine") {
+      plot(foo[[pr]], foo[[vl]], pch=19, col="grey", log="x", bty="n", xlab="Troponin T hs (ng/l)", ylab="Viral load")
+    } else {
+      comp <- paste(unique(foo[[pr]]), collapse="-")
+      showgene(foo[[vl]], foo[[pr]], col="grey", pch=19, main=prnam[pr], ylab="Viral load", comparisons=comp)#, test.func=t.test)
+    }
+  }
+#}
+```
+
+
+
+# Comparison of frequencies
+
+## Batch1 vs Batch2
+
+```{r fig.width=11,fig.height=5}
+sel <- grepl("^LV", hla_l_b2$ID)
+hla_berlin <- rbind(hla_l, hla_l_b2 %>% filter(grepl("^LV", ID))) %>% group_by(allele_trunc_full) %>% summarise(locus=locus[1], n=n()) %>% group_by(locus) %>% mutate(frequency=n/sum(n))
+hla_spain <- hla_l_b2 %>% filter(grepl("^E[SG]", ID)) %>% group_by(allele_trunc_full) %>% summarise(locus=locus[1], n=n()) %>% group_by(locus) %>% mutate(frequency=n/sum(n))
+hla_swiss <- hla_l_b2 %>% filter(grepl("^SB", ID)) %>% group_by(allele_trunc_full) %>% summarise(locus=locus[1], n=n()) %>% group_by(locus) %>% mutate(frequency=n/sum(n))
+hla_gse   <- gse_hla_l %>% group_by(allele_trunc_full) %>% summarise(locus=locus[1], n=n()) %>% group_by(locus) %>% mutate(frequency=n/sum(n))
+
+berlin_vs_spain <- merge(hla_berlin, hla_spain, by="allele_trunc_full", all=TRUE) %>% mutate(col=ifelse(is.na(frequency.x) | is.na(frequency.y), "grey", "darkblue")) %>%
+  replace_na(list(frequency.x=0, frequency.y=0))
+berlin_vs_swiss <- merge(hla_berlin, hla_swiss, by="allele_trunc_full", all=TRUE) %>% mutate(col=ifelse(is.na(frequency.x) | is.na(frequency.y), "grey", "darkblue")) %>%
+  replace_na(list(frequency.x=0, frequency.y=0))
+berlin_vs_gse <- merge(hla_berlin, hla_gse, by="allele_trunc_full", all=TRUE) %>% mutate(col=ifelse(is.na(frequency.x) | is.na(frequency.y), "grey", "darkblue")) %>%
+  replace_na(list(frequency.x=0, frequency.y=0))
+
+
+par(mfrow=c(1,3)) 
+
+with(berlin_vs_spain, plot(frequency.x, frequency.y, pch=19, col=col, xlab="Berlin", ylab="Spain", bty="n"))
+abline(0, 1, col="grey")
+with(berlin_vs_swiss, plot(frequency.x, frequency.y, pch=19, col=col, xlab="Berlin", ylab="Switzerland", bty="n")) 
+abline(0, 1, col="grey")
+with(berlin_vs_gse, plot(frequency.x, frequency.y, pch=19, col=col, xlab="Berlin", ylab="GSE157103", bty="n")) 
+abline(0, 1, col="grey")
+```
+
+## Comparison of frequencies
+
+```{r fig.width=11,fig.height=5}
+pop8 <- read_tsv("../meta_data/allele_frequencies_population_8.txt") %>% rename(frequency="Allele Frequency")
+spain <- read_tsv("../meta_data/allele_frequencies_spain.txt") %>% rename(frequency="Allele Frequency")
+spain_vs_pop8 <- merge(spain, pop8, by="Allele", all=TRUE) %>% 
+  mutate(col=ifelse(is.na(frequency.x) | is.na(frequency.y), "grey", "darkblue")) %>% replace_na(list(frequency.x=0, frequency.y=0))
+pop8_vs_berlin <- merge(hla_berlin %>% mutate(allele_trunc_full=gsub("HLA_", "", allele_trunc_full)), pop8, by.x="allele_trunc_full", by.y="Allele", all=TRUE) %>% 
+  mutate(col=ifelse(is.na(frequency.x) | is.na(frequency.y), "grey", "darkblue")) %>% replace_na(list(frequency.x=0, frequency.y=0))
+pop8_vs_gse <- merge(hla_gse %>% mutate(allele_trunc_full=gsub("HLA_", "", allele_trunc_full)), pop8, by.x="allele_trunc_full", by.y="Allele", all=TRUE) %>% 
+  mutate(col=ifelse(is.na(frequency.x) | is.na(frequency.y), "grey", "darkblue")) %>% replace_na(list(frequency.x=0, frequency.y=0))
+par(mfrow=c(1,3)) 
+with(spain_vs_pop8, plot(frequency.x, frequency.y, pch=19, col=col, ylab="Germany / pop 8", xlab="Spain", bty="n")) 
+abline(0, 1, col="grey")
+with(pop8_vs_berlin, plot(frequency.y, frequency.x, pch=19, col=col, xlab="Germany / pop 8", ylab="Berlin", bty="n", ylim=c(0, .04), xlim=c(0, .1)))
+abline(0, 1, col="grey")
+with(pop8_vs_gse, plot(frequency.y, frequency.x, pch=19, col=col, xlab="Germany / pop 8", ylab="GSE157103", bty="n", ylim=c(0, .04), xlim=c(0, .1)))
+abline(0, 1, col="grey")
+```
+
+
+## Association between HLAs and other covariates
+
+
+```{r}
+foo <- merge(hla, patients_b1, by="Patient_ID")
+ttest.age.icu <- t.test(foo$age ~ foo$icu)
+ttest.age.intub <- t.test(foo$age ~ foo$intub)
+
+freq.overall <- foo %>% filter(locus == "HLA_C") %>% mutate(n=(allele1_trunc == "04:01") + (allele2_trunc == "04:01")) %>% mutate(ret=sum(n)/(2*n())) %>% pull(ret) %>% `[`(1)
+freq.over75   <- foo %>% filter(age > 75) %>% filter(locus == "HLA_C") %>% mutate(n=(allele1_trunc == "04:01") + (allele2_trunc == "04:01")) %>% 
+  mutate(ret=sum(n)/(2*n())) %>% pull(ret) %>% `[`(1)
+freq.below65  <- foo %>% filter(age < 65) %>% filter(locus == "HLA_C") %>% mutate(n=(allele1_trunc == "04:01") + (allele2_trunc == "04:01")) %>% 
+  mutate(ret=sum(n)/(2*n())) %>% pull(ret) %>% `[`(1)
+
+res_sex_sign <- res_sex_summary %>% arrange(p.val) %>% filter(!is.na(p.adj) & p.val < 0.05)
+```
+
+One possibility to explain the association between HLA
+alleles and COVID-19 severity is that these alleles occur at different
+frequencies in different risk groups. For example, maybe HLA C\*04:01 has a
+higher frequency among older patients, who are at greater risk of
+developing severe COVID symptoms. Indeed, both patients who were intubated and stationed at
+the ICU were significantly older than others (p-values from a two-sided
+t-test, respectively,
+`r format.pval(ttest.age.intub$p.value, digits=2)`
+and
+`r format.pval(ttest.age.icu$p.value, digits=2)`). 
+However, for the HLA C\*04:01, the opposite was true: while the allele had
+an overall frequency of 
+`r format(freq.overall, digits=2)`
+and 
+`r format(freq.below65, digits=2)`
+in patients younger than 65, the frequency of the allele was actually lower
+in the high-risk group of patients older than 75 years, 
+`r format(freq.over75, digits=2)`.
+
+To exclude other potential confounding effects, we have tested the
+associations of all alleles with the covariates gender, age, weight and
+BMI. While there were  
+`r length(unique(res_sex_sign$allele))` 
+alleles which showed a significant associations at p < 0.05 (see Supplementary Table
+XX), no association was significant after correction for multiple testing.
+
+
+**Supplementary Table XX.** Associations of HLA alleles and age, gender,
+weight and BMI. Only alleles which pass the specified thresholds 
+(frequency > `r min_freq` and occurs in at least `r min_patient`)
+have been tested for association.
+
+```{r results="markdown"}
+res_sex_sign %>%
+  mutate(freq=format(freq, digits=2),
+         E=format(E, digits=2),
+         p.val=format.pval(p.val, digits=2),
+         p.adj=format.pval(p.adj, digits=2)) %>%
+  select(Allele=allele, Covariate=parameter,
+    Frequency=freq,
+    "Effect size"=E,
+    "P value"=p.val,
+    "FDR"=p.adj) %>%
+    pander(split.tables=Inf)
+
+```
+
+
+## Affinity analysis
+
+```{r}
+aff2 <- read_xls("meta_data/affinity/nguyen_affinity_appendix_3.xls", skip=1, sheet=1) %>% 
+  group_by(Allele) %>% 
+  summarise(n_tightly=sum(Binding_affinity < 50), n_loosly=sum(Binding_affinity < 500)) %>% 
+  rename(allele=Allele) %>% 
+  mutate(allele=gsub("HLA-([ABC])", "HLA_\\1 ", allele))
+
+aff2_orig_50 <- read_xls("meta_data/affinity/nguyen_affinity_appendix_3.xls", skip=1, sheet=1) %>% 
+  rename(allele=Allele) %>% 
+  mutate(allele=gsub("HLA-([ABC])", "HLA_\\1 ", allele)) %>% 
+  filter(Binding_affinity < 50)
+
+aff2_orig_500 <- read_xls("meta_data/affinity/nguyen_affinity_appendix_3.xls", skip=1, sheet=1) %>% 
+  rename(allele=Allele) %>% 
+  mutate(allele=gsub("HLA-([ABC])", "HLA_\\1 ", allele)) %>% 
+  filter(Binding_affinity < 500)
+
+
+
+```
+
+A possible explanation for the effect of an allele on disease severity
+might be an abnormally high or low binding affinity to the SARS-Cov-2
+peptides. To test that hypothesis, we have used a previously described data
+set of putative (computed in silico) binding affinities (ref: Nguyen A,
+David JK, Maden SK, Wood MA, Weeder BR, Nellore A, Thompson RF. Human
+leukocyte antigen susceptibility map for SARS-CoV-2. Journal of virology.
+2020 Apr 17.). Following an approach described by (ref: Iturrieta-Zuazo,
+Ignacio, et al. "Possible role of HLA class-I genotype in SARS-CoV-2
+infection and progression: A pilot study in a cohort of Covid-19 Spanish
+patients." Clinical Immunology 219 (2020): 108572.), for each allele we
+have calculated the number of SARS-Cov-2 peptides which bind either
+"tightly" (at < 50 mM) or "loosely" (at < 500 mM). 
+
+We noticed that HLA C\*04:01 is among ten alleles with the fewest predicted
+binding Sars-Cov-2 peptides (Fig. XX). We thus wanted to systematically
+test the hypothesis that the putative affinity to SARS-Cov-2 peptides is a
+correlate of disease severity. First, for each of the response variables
+(ICU and intubation status, troponine levels, composite score) we tested
+whether the effect size is correlated to the number of potentially binding
+peptides. We included all alleles (not filtered for frequency) in this
+comparison. While in all data sets large effects were never seen in alleles
+with a large number of potentially binding peptides, the negative
+correlation was only significant in DS3 (Spearman test, p < 0.007, $\rho$=0.27). 
+
+Next, for each patient, we have calculated how many SARS-Cov-2 peptides can
+type I alleles present in that patient potentially bind and tested whether
+there is an association between disease severity (using troponine levels,
+intubation and ICU status and composite score as proxies) and that number. However,
+none of the tests showed a significant association.
+
+
+**Fig. XX.** Correlation between the estimated effect size for the
+association between alleles and intubation status and the number of
+peptides putatively recognized by that allele. Each dot corresponds to one
+allele. Left column shows plots for DS1, right column shows plots for DS3;
+upper row shows plots for number of "tightly" binding peptides, lower 
+row shows plots for number of "loosely" binding peptides. Dot size
+corresponds to the p-value in Fisher's exact test. Alleles showing
+significant associations with intubation status are labelled.
+
+
+```{r fig.width=14,fig.height=14}
+tmp <- merge(res_all_summary %>% filter(parameter == "intub"), aff2, by="allele") %>% 
+  filter(!is.na(p.adj)) %>% mutate(label=ifelse(p.val < 0.05 & !is.na(p.adj), allele, ""))
+g1 <- ggplot(tmp,
+  aes(x=E, y=n_tightly, size=-log10(p.val))) + 
+  geom_point(col="#33333366") + 
+  geom_label_repel(aes(label=label), show.legend=FALSE) + ylab("Number of tightly binding peptides")
+g3 <- ggplot(tmp,
+  aes(x=E, y=n_loosly, size=-log10(p.val))) + 
+  geom_point(col="#33333366") + 
+  geom_label_repel(aes(label=label), show.legend=FALSE) + ylab("Number of loosely binding peptides")
+
+
+tmp <- merge(gse_res_summary %>% filter(parameter == "intub"), aff2, by="allele") %>% 
+  filter(!is.na(p.adj)) %>% mutate(label=ifelse(p.val < 0.05 & !is.na(p.adj), allele, ""))
+g2 <- ggplot(tmp, 
+  aes(x=E, y=n_tightly, size=-log10(p.val))) + 
+  geom_point(col="#33333366") + 
+  geom_label_repel(aes(label=label), show.legend=FALSE) + ylab("Number of tightly binding peptides")
+g4 <- ggplot(tmp, 
+  aes(x=E, y=n_loosly, size=-log10(p.val))) + 
+  geom_point(col="#33333366") + 
+  geom_label_repel(aes(label=label), show.legend=FALSE) + ylab("Number of loosely binding peptides")
+plot_grid(g1, g2, g3, g4, labels=c("DS1", "DS3", "DS1", "DS3"), nrow=2)
+```
+
+```{r}
+
+tmp0 <- hla %>% 
+  filter(grepl("HLA_", locus)) %>% 
+  select(Patient_ID, locus, a1=allele1_trunc, a2=allele2_trunc) %>% 
+  mutate(a1=paste(locus, a1), a2=paste(locus, a2)) %>% 
+  pivot_longer(cols=c(a1, a2), names_to="pos", values_to="allele") %>% 
+  mutate(n_loosly=aff2$n_loosly[ match(allele, aff2$allele) ], n_tightly=aff2$n_tightly[ match(allele, aff2$allele) ]) %>% 
+  group_by(Patient_ID) %>% 
+  summarise(n_tightly=sum(n_tightly,na.rm=T), n_loosly=sum(n_loosly, na.rm=T)) %>%
+  full_join(patients_b1, by="Patient_ID")
+
+Npept <- function(aff2_orig, alleles) {
+  aff2_orig %>% filter(allele %in% alleles) %>%
+  filter(!duplicated(Peptide)) %>% nrow
+}
+
+tmp <- hla %>% 
+  filter(grepl("HLA_", locus)) %>% 
+  filter(locus == "HLA_C") %>%
+  select(Patient_ID, locus, a1=allele1_trunc, a2=allele2_trunc) %>% 
+  mutate(a1=paste(locus, a1), a2=paste(locus, a2)) %>% 
+  pivot_longer(cols=c(a1, a2), names_to="pos", values_to="allele") %>% 
+  group_by(Patient_ID) %>% 
+  summarise(n_tightly=Npept(aff2_orig_50, allele), n_loosely=Npept(aff2_orig_500, allele)) %>%
+  full_join(patients_b1, by="Patient_ID")
+
+
+```
+
+
+
+
+# Population stratification
+
+## Methods
+
+Exome data was used to investigate the genetic stratification in the
+analysed samples. For variant calling, XXX[Manuel] was used. The variant
+data was then evaluated using the R package SNPRelate, v. 1.20.1.
+
+
+
+
+
+## Results
+
+
+```{r fig.width=12,fig.height=6}
+library(SNPRelate)
+#snpgdsVCF2GDS("meta_data/exome/merged.vcf", "meta_data/exome/merged.gds")
+if(exists("genofile")) snpgdsClose(genofile)
+genofile <- snpgdsOpen("meta_data/exome/merged.gds")
+batch1_hla <- hla_all %>% mutate(INTUB=ifelse(intub=="0", "no", "yes")) %>% select(ID=Patient_ID, locus, allele1=allele1_trunc, allele2=allele2_trunc, ICU=icu, INTUB)
+batch2_hla <- hla_batch2 %>% select(ID, locus, allele1=allele1_trunc, allele2=allele1_trunc, ICU, INTUB=intub)
+batch12_hla <- rbind(batch1_hla, batch2_hla) %>% mutate(ICU=toupper(ICU), INTUB=toupper(INTUB)) %>% filter(!is.na(ICU))
+batch12_hla_w <- batch12_hla %>% pivot_wider(id_cols=c(ID, ICU, INTUB), names_from=locus, values_from=c(allele1, allele2))
+
+snp_ids <- read.gdsn(index.gdsn(genofile, path="sample.id"))
+snp_hla <- data.frame(SNP_id=snp_ids) %>%
+  mutate(CC_ID=gsub("-N1.*", "", SNP_id)) %>% 
+  left_join(key, by="CC_ID") %>% 
+  mutate(ID=ifelse(!is.na(Patient_ID), Patient_ID, CC_ID)) %>%
+  select(SNP_id, ID) %>% filter(!duplicated(SNP_id)) %>%
+  mutate(Cohort=ifelse(grepl("^ES", ID), "ES", ifelse(grepl("^SB", ID), "CH", "DE"))) %>%
+  left_join(batch12_hla_w, by="ID") %>% 
+  mutate(HLAC0401=ifelse(allele1_HLA_C == "04:01" | allele2_HLA_C == "04:01", "Present", "Absent")) %>%
+  filter(!is.na(HLAC0401))
+
+snpset <- snpgdsLDpruning(genofile, ld.threshold=0.2)
+snp.pca <- snpgdsPCA(genofile, snp.id=unlist(snpset))
+sel <- snp.pca$sample.id %in% snp_hla$SNP_id
+pca <- snp.pca$eigenvect[sel, ]
+
+ds1_ids <- intersect(snp_ids[ !grepl("^(SB|ES)", snp_ids) ], snp_hla$SNP_id)
+ds2_ids <- intersect(snp_ids[  grepl("^(SB|ES)", snp_ids) ], snp_hla$SNP_id)
+
+snp_pca_ds1 <- snpgdsPCA(genofile, sample.id=ds1_ids, snp.id=unlist(snpset))
+sel_ds1 <- match(ds1_ids, snp_hla$SNP_id)
+
+snp_pca_ds2 <- snpgdsPCA(genofile, sample.id=ds2_ids, snp.id=unlist(snpset))
+sel_ds2 <- match(ds2_ids, snp_hla$SNP_id)
+
+## check for association with HLA 04:01
+## check for association with intub / ICU
+## use only DS1
+
+
+par(mfrow=c(1,2))
+plot(
+  snp_pca_ds1$eigenvect[,1], 
+  snp_pca_ds1$eigenvect[,2], 
+  pch=19, col="grey", bty="n", xlab="PC 1", ylab="PC 2", main="Data set 1")
+abline(h=0, col="darkgrey", lty=2)
+abline(v=0, col="darkgrey", lty=2)
+
+plot(
+  snp_pca_ds2$eigenvect[,1], 
+  snp_pca_ds2$eigenvect[,2], 
+  pch=19, col="grey", bty="n", xlab="PC 1", ylab="PC 2", main="Data set 2")
+abline(h=0, col="darkgrey", lty=2)
+abline(v=0, col="darkgrey", lty=2)
+
+
+```
+
+
+
+# SessionInfo
+
+
+```{r results="markdown"}
+sessionInfo()
+```
+
+
+
