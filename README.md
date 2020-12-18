@@ -1,0 +1,2 @@
+# covidhla
+Covid HLA associations
